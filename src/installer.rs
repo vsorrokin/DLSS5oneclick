@@ -1921,12 +1921,25 @@ pub fn nvidia_dll(client: &Client, name: &str) -> Option<(String, String)> {
 // ── step 1: ReShade ────────────────────────────────────────────────
 
 pub fn resolve_reshade_setup(client: &Client) -> Result<(String, String)> {
-    let html = net::get_text(client, RESHADE_HOME)?;
+    resolve_reshade_setup_at(client, RESHADE_HOME)
+}
+
+fn resolve_reshade_setup_at(client: &Client, home: &str) -> Result<(String, String)> {
+    let resp = client.get(home).send()
+        .with_context(|| format!("request failed: {home}"))?;
+    let status = resp.status();
+    // ReShade's Gantry template can return HTTP 500 while still rendering the
+    // official download link. Accept that specific response, not arbitrary
+    // authentication failures or links supplied by third-party mirrors.
+    if !status.is_success() && status != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        bail!("{home}: HTTP {status}");
+    }
+    let html = resp.text().with_context(|| format!("bad body from {home}"))?;
     let re = Regex::new(r"/downloads/ReShade_Setup_([\d.]+)_Addon\.exe").unwrap();
     let m = re
         .captures(&html)
         .ok_or_else(|| anyhow!("ReShade add-on installer link not found on reshade.me"))?;
-    Ok((m[1].to_owned(), format!("{RESHADE_HOME}{}", &m[0])))
+    Ok((m[1].to_owned(), format!("{home}{}", &m[0])))
 }
 
 pub fn install_reshade_from_setup(
@@ -4084,6 +4097,35 @@ mod tests {
     use serde_json::json;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn reshade_link_survives_template_http_500() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        for (status, body, expected) in [
+            ("200 OK", "/downloads/ReShade_Setup_6.8.0_Addon.exe", true),
+            ("500 Internal Server Error", "/downloads/ReShade_Setup_6.8.0_Addon.exe", true),
+            ("500 Internal Server Error", "template failed", false),
+            ("403 Forbidden", "/downloads/ReShade_Setup_6.8.0_Addon.exe", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let home = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 1];
+                stream.read_exact(&mut request).unwrap();
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let client = Client::builder().no_proxy()
+                .timeout(std::time::Duration::from_secs(5)).build().unwrap();
+            let result = resolve_reshade_setup_at(&client, &home);
+            assert_eq!(result.is_ok(), expected, "{status}: {result:?}");
+            if expected {
+                assert_eq!(result.unwrap(), ("6.8.0".into(), format!("{home}/downloads/ReShade_Setup_6.8.0_Addon.exe")));
+            }
+            server.join().unwrap();
+        }
+    }
 
     fn rhi_releases() -> Vec<Value> {
         ["streamline-2.13.0.0", "renodx-dlss5-4.55", "renodx-dlss5-4.5", "renodx-dlss5-3.3.4",
