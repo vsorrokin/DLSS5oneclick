@@ -4112,8 +4112,14 @@ mod tests {
             let home = format!("http://{}", listener.local_addr().unwrap());
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 1];
-                stream.read_exact(&mut request).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0; 1];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() <= 16384, "oversized request headers");
+                }
                 write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             });
             let client = Client::builder().no_proxy()
